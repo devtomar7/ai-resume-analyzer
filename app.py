@@ -1,69 +1,312 @@
-from flask import Flask, render_template, request, send_file
-from analyzer import analyze_resume
-import os
+from flask import Flask, render_template, request, redirect, url_for, session, send_file
+import PyPDF2
+import pdfplumber
+import io
+
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_bcrypt import Bcrypt
+from pymongo import MongoClient
+
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
+# ---------------- APP ----------------
 app = Flask(__name__)
+app.secret_key = "secret123"
 
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+bcrypt = Bcrypt(app)
 
+# ---------------- LOGIN MANAGER ----------------
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"
 
-@app.route("/", methods=["GET", "POST"])
-def index():
+# ---------------- MONGODB ----------------
+client = MongoClient("mongodb+srv://devtomar:dev123@cluster0.d1uq051.mongodb.net/resumeAI?retryWrites=true&w=majority")
+db = client["resumeAI"]
+users_collection = db["users"]
 
-    if request.method == "POST":
+# ---------------- USER ----------------
+class User(UserMixin):
+    def __init__(self, username):
+        self.id = username
 
-        file = request.files["resume"]
-        job_desc = request.form.get("jobdesc")
-
-        if file:
-
-            path = os.path.join(UPLOAD_FOLDER, file.filename)
-            file.save(path)
-
-            score, skills, role, missing, match, feedback = analyze_resume(path, job_desc)
-
-            return render_template(
-                "index.html",
-                score=score,
-                skills=skills,
-                role=role,
-                missing=missing,
-                match=match,
-                feedback=feedback
-            )
-
-    return render_template("index.html")
+@login_manager.user_loader
+def load_user(user_id):
+    user = users_collection.find_one({"username": user_id})
+    return User(user_id) if user else None
 
 
-@app.route("/download")
-def download():
+# ---------------- PDF TEXT ----------------
+def extract_text_from_pdf(file):
+    text = ""
+    file.seek(0)
 
-    score = request.args.get("score")
-    role = request.args.get("role")
-    skills = request.args.get("skills")
-    missing = request.args.get("missing")
+    try:
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text += t
+        print("✅ pdfplumber used")
+    except:
+        pass
 
-    file_path = "resume_report.pdf"
+    if text.strip() == "":
+        try:
+            file.seek(0)
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                t = page.extract_text()
+                if t:
+                    text += t
+            print("✅ PyPDF2 used")
+        except:
+            pass
+
+    return text
+
+
+# ---------------- SKILLS ----------------
+def extract_skills(text):
+    skills = ["python","java","c++","html","css","javascript","react","node","flask","django","sql","mongodb","git","docker","aws","ai"]
+    text = text.lower()
+    return list(set([s for s in skills if s in text]))
+
+
+# ---------------- ANALYSIS ----------------
+def analyze_resume(jd, resume):
+    jd_skills = extract_skills(jd)
+    resume_skills = extract_skills(resume)
+
+    match = list(set(jd_skills) & set(resume_skills))
+    missing = list(set(jd_skills) - set(resume_skills))
+
+    score = (len(match)/len(jd_skills))*100 if jd_skills else 0
+    return round(score,2), match, missing
+
+
+# ---------------- CREATE PDF ----------------
+def create_pdf(score, role, skills, missing, feedback):
+    buffer = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        rightMargin=40, leftMargin=40,
+        topMargin=40, bottomMargin=30
+    )
 
     styles = getSampleStyleSheet()
-    elements = []
 
-    elements.append(Paragraph("AI Resume Analyzer Report", styles['Title']))
-    elements.append(Spacer(1, 20))
+    # CUSTOM STYLES
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
 
-    elements.append(Paragraph(f"Resume Score: {score}", styles['Normal']))
-    elements.append(Paragraph(f"Recommended Role: {role}", styles['Normal']))
-    elements.append(Paragraph(f"Detected Skills: {skills}", styles['Normal']))
-    elements.append(Paragraph(f"Missing Skills: {missing}", styles['Normal']))
+    title_style = ParagraphStyle(
+        name='TitleStyle',
+        fontSize=20,
+        textColor=colors.darkblue,
+        spaceAfter=15
+    )
 
-    pdf = SimpleDocTemplate(file_path)
-    pdf.build(elements)
+    section_style = ParagraphStyle(
+        name='SectionStyle',
+        fontSize=14,
+        textColor=colors.white,
+        backColor=colors.darkblue,
+        padding=8,
+        spaceAfter=10
+    )
 
-    return send_file(file_path, as_attachment=True)
+    normal_style = styles['Normal']
+
+    highlight_style = ParagraphStyle(
+        name='Highlight',
+        fontSize=16,
+        textColor=colors.green,
+        spaceAfter=10
+    )
+
+    content = []
+
+    # TITLE
+    content.append(Paragraph("AI Resume Analysis Report", title_style))
+
+    # USER INFO
+    content.append(Paragraph(f"<b>User:</b> {current_user.id}", normal_style))
+    content.append(Paragraph(f"<b>Role:</b> {role}", normal_style))
+
+    # SCORE (BIG)
+    content.append(Spacer(1, 10))
+    content.append(Paragraph(f"Score: {score}%", highlight_style))
+
+    content.append(Spacer(1, 15))
+
+    # MATCHED SKILLS
+    content.append(Paragraph("Matched Skills", section_style))
+    content.append(Paragraph(", ".join(skills or []), normal_style))
+
+    content.append(Spacer(1, 10))
+
+    # MISSING SKILLS
+    content.append(Paragraph("Missing Skills", section_style))
+    content.append(Paragraph(", ".join(missing or []), normal_style))
+
+    content.append(Spacer(1, 10))
+
+    # FEEDBACK
+    content.append(Paragraph("Feedback", section_style))
+
+    for f in (feedback or []):
+        content.append(Paragraph(f"• {f}", normal_style))
+
+    content.append(Spacer(1, 20))
+
+    # FOOTER
+    content.append(Paragraph("Generated by AI Resume Analyzer 🚀", styles['Italic']))
+
+    doc.build(content)
+    buffer.seek(0)
+
+    return buffer
+
+
+# ---------------- LOGIN ----------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+
+        user = users_collection.find_one({"username": username})
+        print("USER:", user)
+
+        if user and bcrypt.check_password_hash(user["password"], password):
+            login_user(User(username), remember=True)
+            print("✅ LOGIN SUCCESS")
+            return redirect(url_for("dashboard"))
+        else:
+            print("❌ LOGIN FAILED")
+
+    return render_template("login.html")
+
+
+# ---------------- SIGNUP ----------------
+@app.route("/signup", methods=["GET","POST"])
+def signup():
+    if request.method == "POST":
+        username = request.form["username"]
+        password = request.form["password"]
+
+        if users_collection.find_one({"username": username}):
+            return "User already exists ❌"
+
+        hashed = bcrypt.generate_password_hash(password).decode()
+
+        users_collection.insert_one({
+            "username": username,
+            "password": hashed
+        })
+
+        print("✅ User saved")
+
+        return redirect(url_for("login"))
+
+    return render_template("signup.html")
+
+
+# ---------------- LOGOUT ----------------
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# ---------------- DASHBOARD ----------------
+@app.route("/", methods=["GET","POST"])
+@login_required
+def dashboard():
+
+    if request.method == "POST":
+        print("🔥 FORM SUBMITTED")
+
+        jd = request.form.get("jd")
+        file = request.files.get("resume")
+
+        if not file or file.filename == "":
+            print("❌ No file")
+            return redirect(url_for("dashboard"))
+
+        if not jd:
+            print("❌ No JD")
+            return redirect(url_for("dashboard"))
+
+        text = extract_text_from_pdf(file)
+
+        if not text or text.strip() == "":
+            print("❌ No text extracted")
+            return redirect(url_for("dashboard"))
+
+        score, skills, missing = analyze_resume(jd, text)
+
+        role = "Software Developer" if score > 50 else "Needs Improvement"
+
+        feedback = []
+        if score > 75:
+            feedback = ["Excellent 🚀"]
+        elif score > 50:
+            feedback = ["Good match"]
+        else:
+            feedback = ["Improve skills", "Add projects"]
+
+        session["score"] = score
+        session["match"] = score
+        session["role"] = role
+        session["skills"] = skills
+        session["missing"] = missing
+        session["feedback"] = feedback
+
+        print("✅ ANALYSIS DONE")
+
+        return redirect(url_for("dashboard"))
+
+    return render_template(
+        "index.html",
+        score=session.get("score"),
+        match=session.get("match"),
+        role=session.get("role"),
+        skills=session.get("skills"),
+        missing=session.get("missing"),
+        feedback=session.get("feedback"),
+    )
+
+
+# ---------------- DOWNLOAD ----------------
+@app.route("/download")
+@login_required
+def download():
+
+    score = session.get("score")
+    role = session.get("role")
+    skills = session.get("skills")
+    missing = session.get("missing")
+    feedback = session.get("feedback")
+
+    if not score:
+        return "No report available"
+
+    pdf = create_pdf(score, role, skills, missing, feedback)
+
+    return send_file(
+        pdf,
+        as_attachment=True,
+        download_name="resume_report.pdf",
+        mimetype="application/pdf"
+    )
+
+
+# ---------------- RUN ----------------
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True)
